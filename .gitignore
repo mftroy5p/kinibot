@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Environment variables (API Key & nomor sensitif)
+.env
+.env.*
+
+# Sesi login WhatsApp Baileys (WAJIB di-ignore agar akun WA tidak dibajak)
+auth_info_baileys/
+
+# Database ingatan percakapan & data pribadi customer
+chat_memory.json
+
+# Log & file sistem bawaan OS / editor
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+.wwebjs_auth/
+.wwebjs_cache/
