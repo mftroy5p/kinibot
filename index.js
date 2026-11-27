@@ -19,6 +19,10 @@ const MEMORY_FILE = path.join(__dirname, 'chat_memory.json');
 const RULES_FILE = path.join(__dirname, 'knowledge', 'rules.md');
 const PRODUCT_FILE = path.join(__dirname, 'knowledge', 'product_knowledge.md');
 const RETENTION_MS = 60 * 24 * 60 * 60 * 1000; // 60 hari dalam milidetik
+const ERROR_PAUSE_MS = 30 * 60 * 1000; // 30 menit jeda otomatis saat API gagal total
+
+const PRIMARY_MODEL = 'gemini-3.5-flash-lite';
+const FALLBACK_MODEL = 'gemini-3.6-flash';
 
 // 1. Inisialisasi Gemini AI (Membaca rules.md & product_knowledge.md secara dinamis)
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
@@ -59,9 +63,9 @@ function getKnowledgeLastModified() {
   return latestMtime;
 }
 
-function createGeminiModel() {
+function createGeminiModel(modelName = PRIMARY_MODEL) {
   return genAI.getGenerativeModel({
-    model: 'gemini-3.5-flash-lite',
+    model: modelName,
     systemInstruction: loadSystemInstruction(),
     generationConfig: {
       maxOutputTokens: 2048,
@@ -74,7 +78,7 @@ function createGeminiModel() {
 let persistentStore = {};
 
 // Memory session aktif di RAM
-// Format: { [jid]: { status: 'AI' | 'HUMAN', chatSession, loadedKnowledgeMtime, messageBuffer: [], imageBuffer: [], replyTimer: null } }
+// Format: { [jid]: { status: 'AI' | 'HUMAN', chatSession, loadedKnowledgeMtime, messageBuffer: [], imageBuffer: [], replyTimer: null, autoResumeTimer: null } }
 const userSessions = {};
 
 // Menyimpan ID pesan yang dikirim oleh bot agar tidak terdeteksi sebagai pesan manual CS
@@ -229,22 +233,76 @@ function getOrCreateSession(jid) {
 
     userSessions[jid] = {
       status: restoredStatus,
-      chatSession: createGeminiModel().startChat({ history: restoredHistory }),
+      chatSession: createGeminiModel(PRIMARY_MODEL).startChat({ history: restoredHistory }),
       loadedKnowledgeMtime: currentKnowledgeMtime,
       messageBuffer: [],
       imageBuffer: [],
       replyTimer: null,
+      autoResumeTimer: null,
     };
   } else if (userSessions[jid].loadedKnowledgeMtime !== currentKnowledgeMtime) {
     // Jika file rules.md atau product_knowledge.md baru saja diedit, muat ulang instruksi tanpa mematikan bot
     const saved = persistentStore[jid];
     const restoredHistory = saved ? buildValidGeminiHistory(saved.messages || []) : [];
-    userSessions[jid].chatSession = createGeminiModel().startChat({ history: restoredHistory });
+    userSessions[jid].chatSession = createGeminiModel(PRIMARY_MODEL).startChat({ history: restoredHistory });
     userSessions[jid].loadedKnowledgeMtime = currentKnowledgeMtime;
     console.log(`🔄 Knowledge (.md) diperbarui otomatis untuk sesi ${jid}.`);
   }
 
   return userSessions[jid];
+}
+
+// Helper pemanggilan Gemini dengan Auto-Retry (3x dalam 5 detik) + Fallback ke gemini-3.6-flash
+async function generateAIResponseWithFallback(jid, session, geminiPayload) {
+  const maxRetries = 3;
+  const retryDelayMs = 2500; // Percobaan 1 (0s) -> tunggu 2.5s -> Percobaan 2 (2.5s) -> tunggu 2.5s -> Percobaan 3 (5.0s)
+  let lastError = null;
+
+  // 1. Coba model utama maksimal 3 kali dalam rentang 5 detik
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const result = await session.chatSession.sendMessage(geminiPayload);
+      const text = result.response.text().trim();
+
+      if (text) {
+        return { text, modelUsed: PRIMARY_MODEL };
+      }
+
+      const finishReason = result.response.candidates?.[0]?.finishReason;
+      throw new Error(`Respons teks kosong (FinishReason: ${finishReason || 'UNKNOWN'})`);
+    } catch (err) {
+      lastError = err;
+      console.warn(`⚠️ [${PRIMARY_MODEL}] Percobaan ${attempt}/${maxRetries} gagal: ${err.message}`);
+      if (attempt < maxRetries) {
+        await sleep(retryDelayMs);
+      }
+    }
+  }
+
+  // 2. Fallback ke gemini-3.6-flash jika model utama gagal 3x
+  console.log(`🔄 Mengalihkan ke model cadangan (${FALLBACK_MODEL}) untuk ${jid}...`);
+  try {
+    const saved = persistentStore[jid];
+    const restoredHistory = saved ? buildValidGeminiHistory(saved.messages || []) : [];
+    const fallbackChatSession = createGeminiModel(FALLBACK_MODEL).startChat({
+      history: restoredHistory,
+    });
+
+    const fallbackResult = await fallbackChatSession.sendMessage(geminiPayload);
+    const fallbackText = fallbackResult.response.text().trim();
+
+    if (fallbackText) {
+      // Perbarui chatSession aktif dengan sesi fallback yang berhasil merespons
+      session.chatSession = fallbackChatSession;
+      return { text: fallbackText, modelUsed: FALLBACK_MODEL };
+    }
+
+    const finishReason = fallbackResult.response.candidates?.[0]?.finishReason;
+    throw new Error(`Respons fallback kosong (FinishReason: ${finishReason || 'UNKNOWN'})`);
+  } catch (fallbackErr) {
+    console.error(`❌ [${FALLBACK_MODEL}] Model cadangan juga gagal: ${fallbackErr.message}`);
+    throw fallbackErr || lastError;
+  }
 }
 
 // Muat memori dari disk saat aplikasi pertama kali dijalankan & jadwalkan pembersihan tiap 12 jam
@@ -350,6 +408,10 @@ async function startKiniBot() {
           clearTimeout(session.replyTimer);
           session.replyTimer = null;
         }
+        if (session.autoResumeTimer) {
+          clearTimeout(session.autoResumeTimer);
+          session.autoResumeTimer = null;
+        }
         session.messageBuffer = [];
         session.imageBuffer = [];
         console.log(`🛑 [MANUAL OFF] CS mematikan AI untuk ${senderNumber} (emoji ⛰️⛰️ terdeteksi).`);
@@ -361,6 +423,9 @@ async function startKiniBot() {
         if (session.replyTimer) {
           clearTimeout(session.replyTimer);
         }
+        if (session.autoResumeTimer) {
+          clearTimeout(session.autoResumeTimer);
+        }
         // Reset memori percakapan lama untuk sesi baru
         persistentStore[remoteJid] = {
           status: 'AI',
@@ -371,11 +436,12 @@ async function startKiniBot() {
 
         userSessions[remoteJid] = {
           status: 'AI',
-          chatSession: createGeminiModel().startChat({ history: [] }),
+          chatSession: createGeminiModel(PRIMARY_MODEL).startChat({ history: [] }),
           loadedKnowledgeMtime: getKnowledgeLastModified(),
           messageBuffer: [],
           imageBuffer: [],
           replyTimer: null,
+          autoResumeTimer: null,
         };
         console.log(`🟢 [MANUAL ON] CS menyalakan kembali AI untuk ${senderNumber} (emoji 🏕️🏕️ terdeteksi).`);
         return;
@@ -396,7 +462,7 @@ async function startKiniBot() {
 
     const session = getOrCreateSession(remoteJid);
 
-    // Jika chat sudah diambil alih CS manusia, bot berhenti merespons nomor ini
+    // Jika chat sudah diambil alih CS manusia atau sedang jeda 30 menit, bot berhenti merespons nomor ini
     if (session.status === 'HUMAN') {
       console.log(`⏸️ Status ${senderNumber} sudah HUMAN. Bot AI diam.`);
       return;
@@ -413,6 +479,10 @@ async function startKiniBot() {
       if (session.replyTimer) {
         clearTimeout(session.replyTimer);
         session.replyTimer = null;
+      }
+      if (session.autoResumeTimer) {
+        clearTimeout(session.autoResumeTimer);
+        session.autoResumeTimer = null;
       }
       session.messageBuffer = [];
       session.imageBuffer = [];
@@ -434,7 +504,8 @@ async function startKiniBot() {
       );
 
       // 2. Kirim Alert Notifikasi ke Nomor WA CS Asli
-      const csNumberClean = process.env.CS_WA_NUMBER.replace(/[^0-9]/g, '');
+      const rawCsNumber = process.env.CS_WA_NUMBER || process.env.cs_wa_number || '';
+      const csNumberClean = rawCsNumber.replace(/[^0-9]/g, '');
       const csJid = `${csNumberClean}@s.whatsapp.net`;
 
       const alertMessage = 
@@ -515,6 +586,7 @@ ${messageText}
     console.log(`⏳ Menunggu ${(totalDelayMs / 1000).toFixed(1)} detik sebelum membalas ${senderNumber}...`);
 
     session.replyTimer = setTimeout(async () => {
+      let combinedMessage = '';
       try {
         // Cek ulang status jika CS tiba-tiba mematikan AI saat bot sedang menunggu
         if (session.status === 'HUMAN') {
@@ -538,7 +610,7 @@ ${messageText}
         }
 
         // Gabungkan seluruh pesan beruntun & gambar menjadi satu payload utuh
-        const combinedMessage = session.messageBuffer.join('\n');
+        combinedMessage = session.messageBuffer.join('\n');
         const imagesToSend = [...session.imageBuffer];
 
         session.messageBuffer = [];
@@ -549,41 +621,72 @@ ${messageText}
         const geminiPayload =
           imagesToSend.length > 0 ? [combinedMessage, ...imagesToSend] : combinedMessage;
 
-        let result = await session.chatSession.sendMessage(geminiPayload);
-        let aiResponse = result.response.text().trim();
-
-        // Pengaman jika respons pertama kosong
-        if (!aiResponse) {
-          console.warn(
-            '⚠️ Jawaban Gemini kosong. FinishReason:',
-            result.response.candidates?.[0]?.finishReason
-          );
-          result = await session.chatSession.sendMessage(geminiPayload);
-          aiResponse = result.response.text().trim();
-        }
+        // Panggil Gemini dengan 3x auto-retry (5 detik) + fallback ke gemini-3.6-flash
+        const { text: aiResponse, modelUsed } = await generateAIResponseWithFallback(
+          remoteJid,
+          session,
+          geminiPayload
+        );
 
         await sock.sendPresenceUpdate('paused', remoteJid);
 
-        if (aiResponse) {
-          await sendBotMessage(remoteJid, { text: aiResponse });
-          // Simpan percakapan ke memori permanen 60 hari
-          appendConversationTurn(remoteJid, combinedMessage, aiResponse);
-          console.log(`🤖 MinKI membalas ke ${senderNumber}: "${aiResponse}"`);
-        } else {
-          console.error('❌ Gemini tetap mengembalikan teks kosong setelah percobaan ulang.');
-          await sendBotMessage(remoteJid, {
-            text: 'Siap kak, boleh infoin lebih detail rencananya biar aku bantu cekin? 😊',
-          });
-        }
+        await sendBotMessage(remoteJid, { text: aiResponse });
+        // Simpan percakapan ke memori permanen 60 hari
+        appendConversationTurn(remoteJid, combinedMessage, aiResponse);
+        console.log(`🤖 MinKI (${modelUsed}) membalas ke ${senderNumber}: "${aiResponse}"`);
       } catch (error) {
         session.messageBuffer = [];
         session.imageBuffer = [];
         session.replyTimer = null;
         await sock.sendPresenceUpdate('paused', remoteJid);
-        console.error('❌ Error saat memanggil Gemini API:', error);
-        await sendBotMessage(remoteJid, {
-          text: 'Mohon maaf kak, jaringan sedang agak gangguan sebentar. Tim kami segera bantu ya 🙏',
-        });
+
+        console.error('❌ Semua percobaan Gemini API & fallback gagal:', error);
+
+        // Nonaktifkan bot untuk customer ini selama 30 menit (tanpa mengirim pesan maaf ke customer)
+        session.status = 'HUMAN';
+        updatePersistedStatus(remoteJid, 'HUMAN');
+
+        if (session.autoResumeTimer) {
+          clearTimeout(session.autoResumeTimer);
+        }
+
+        session.autoResumeTimer = setTimeout(() => {
+          if (userSessions[remoteJid] && userSessions[remoteJid].status === 'HUMAN') {
+            userSessions[remoteJid].status = 'AI';
+            userSessions[remoteJid].autoResumeTimer = null;
+            updatePersistedStatus(remoteJid, 'AI');
+            console.log(`🟢 [AUTO ON] Jeda 30 menit selesai. AI aktif kembali untuk ${senderNumber}.`);
+          }
+        }, ERROR_PAUSE_MS);
+
+        console.log(`⏸️ Bot dinonaktifkan otomatis selama 30 menit untuk ${senderNumber}.`);
+
+        // Kirim pesan alert ke nomor CS / Owner di .env
+        const rawCsNumber = process.env.CS_WA_NUMBER || process.env.cs_wa_number || '';
+        const csNumberClean = rawCsNumber.replace(/[^0-9]/g, '');
+
+        if (csNumberClean) {
+          const csJid = `${csNumberClean}@s.whatsapp.net`;
+          const errorAlertMessage =
+`⚠️ *ALERT GANGGUAN AI KINI TRIP* ⚠️
+Bot gagal membalas pesan customer setelah 3x percobaan (${PRIMARY_MODEL}) dan model cadangan (${FALLBACK_MODEL}).
+
+*Kontak Customer:* wa.me/${senderNumber}
+*Pesan Terakhir Customer:*
+${combinedMessage || '(Pesan media/gambar)'}
+*Detail Error:* ${error?.message || 'Unknown Error'}
+
+⏸️ *Bot otomatis DINONAKTIFKAN selama 30 menit untuk nomor ini* (tidak ada balasan terkirim ke customer). Silakan CS ambil alih manual, atau kirim pesan berakhiran 🏕️🏕️ di chat customer jika ingin menyalakan bot lebih cepat.`;
+
+          try {
+            await sendBotMessage(csJid, { text: errorAlertMessage });
+            console.log(`🚨 [ALERT ERROR SENT] Notifikasi gangguan dikirim ke CS (${csNumberClean}).`);
+          } catch (alertErr) {
+            console.error('❌ Gagal mengirim alert gangguan ke nomor CS:', alertErr);
+          }
+        } else {
+          console.warn('⚠️ Nomor CS_WA_NUMBER belum diatur di file .env, alert tidak terkirim.');
+        }
       }
     }, initialWaitMs);
   });
